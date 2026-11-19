@@ -26,15 +26,17 @@ locals {
     b = "10.0.22.0/24"
   }
 
-  # Paid parts: OFF until the cost review.
+  # Paid parts: OFF (zero budget). Each needs a cost check and approval first.
   enable_nat_gateway         = false
   enable_interface_endpoints = false
   enable_flow_logs           = false
 
-  db_port = 3306 # RDS MySQL
+  db_port  = 3306 # RDS MySQL
+  app_port = 8080
 
-  # Pending: rules that need app_port are skipped until it is set.
-  app_port             = null # Moaaz
+  # Approved test IPs for the ALB on port 80. Empty = no access.
+  alb_allowed_cidrs = []
+
   flow_logs_bucket_arn = null # team logging bucket, needed when enable_flow_logs = true
 
   any_ipv4       = "0.0.0.0/0"
@@ -280,21 +282,21 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
+  for_each = toset(local.alb_allowed_cidrs)
+
   security_group_id = aws_security_group.alb.id
-  description       = "HTTP from the internet"
+  description       = "HTTP from approved test IPs"
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80
-  cidr_ipv4         = local.any_ipv4
-}
+  cidr_ipv4         = each.value
 
-resource "aws_vpc_security_group_ingress_rule" "alb_https" {
-  security_group_id = aws_security_group.alb.id
-  description       = "HTTPS from the internet"
-  ip_protocol       = "tcp"
-  from_port         = 443
-  to_port           = 443
-  cidr_ipv4         = local.any_ipv4
+  lifecycle {
+    precondition {
+      condition     = can(cidrhost(each.value, 0)) && try(tonumber(split("/", each.value)[1]) >= 24, false)
+      error_message = "alb_allowed_cidrs takes approved test IPs only: IPv4 CIDRs of /24 or smaller."
+    }
+  }
 }
 
 # ICMP type 3 code 4 ("fragmentation needed") for Path MTU Discovery.
@@ -318,7 +320,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_app" {
   referenced_security_group_id = aws_security_group.app.id
 }
 
-# No SSH on purpose: admins use Systems Manager Session Manager.
+# No SSH. Admin access path is pending a team decision (no NAT, no endpoints).
 resource "aws_security_group" "app" {
   name        = "${local.name_prefix}-app-sg"
   description = "App security group"
@@ -340,9 +342,20 @@ resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
   referenced_security_group_id = aws_security_group.alb.id
 }
 
-resource "aws_vpc_security_group_egress_rule" "app_http_out" {
+resource "aws_vpc_security_group_egress_rule" "app_to_s3" {
   security_group_id = aws_security_group.app.id
-  description       = "HTTP out for software updates"
+  description       = "HTTPS to S3 through the gateway endpoint"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = aws_vpc_endpoint.s3.prefix_list_id
+}
+
+resource "aws_vpc_security_group_egress_rule" "app_http_out" {
+  count = local.enable_nat_gateway ? 1 : 0
+
+  security_group_id = aws_security_group.app.id
+  description       = "HTTP out through the NAT"
   ip_protocol       = "tcp"
   from_port         = 80
   to_port           = 80
@@ -350,8 +363,10 @@ resource "aws_vpc_security_group_egress_rule" "app_http_out" {
 }
 
 resource "aws_vpc_security_group_egress_rule" "app_https_out" {
+  count = local.enable_nat_gateway ? 1 : 0
+
   security_group_id = aws_security_group.app.id
-  description       = "HTTPS out for software updates, S3 and Systems Manager"
+  description       = "HTTPS out through the NAT"
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
@@ -414,6 +429,17 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_from_app" {
   referenced_security_group_id = aws_security_group.app.id
 }
 
+resource "aws_vpc_security_group_egress_rule" "app_to_endpoints" {
+  count = local.enable_interface_endpoints ? 1 : 0
+
+  security_group_id            = aws_security_group.app.id
+  description                  = "HTTPS to the interface endpoints"
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+  referenced_security_group_id = aws_security_group.endpoints[0].id
+}
+
 # Quarantine for incident response: no rules, so no new connections in or out.
 resource "aws_security_group" "isolation" {
   name        = "${local.name_prefix}-isolation-sg"
@@ -443,20 +469,20 @@ resource "aws_network_acl" "tier" {
 }
 
 # Stateless NACLs: replies use 1024-65535 (ALB, NAT) or 32768-65535 (servers).
-# Rules with a pending (null) port are skipped.
+# Rules with a null port are skipped (their switch is off).
 locals {
   nacl_rules = {
-    # Public. Port 3389 is allowed only from inside the VPC (Security Hub EC2.21).
-    public_in_http         = { nacl = "public", egress = false, rule = 100, from = 80, to = 80, cidr = local.any_ipv4 }
-    public_in_https        = { nacl = "public", egress = false, rule = 110, from = 443, to = 443, cidr = local.any_ipv4 }
-    public_in_replies_lo   = { nacl = "public", egress = false, rule = 120, from = 1024, to = 3388, cidr = local.any_ipv4 }
-    public_in_replies_hi   = { nacl = "public", egress = false, rule = 121, from = 3390, to = 65535, cidr = local.any_ipv4 }
-    public_in_replies_3389 = { nacl = "public", egress = false, rule = 122, from = 3389, to = 3389, cidr = local.vpc_cidr }
-    public_out_http        = { nacl = "public", egress = true, rule = 100, from = 80, to = 80, cidr = local.any_ipv4 }
-    public_out_https       = { nacl = "public", egress = true, rule = 110, from = 443, to = 443, cidr = local.any_ipv4 }
-    public_out_replies     = { nacl = "public", egress = true, rule = 120, from = 1024, to = 65535, cidr = local.any_ipv4 }
-    public_out_app_a       = { nacl = "public", egress = true, rule = 130, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.a }
-    public_out_app_b       = { nacl = "public", egress = true, rule = 131, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.b }
+    # Public. Internet rules other than port 80 are only for the NAT; replies skip 3389 (EC2.21).
+    public_in_http        = { nacl = "public", egress = false, rule = 100, from = 80, to = 80, cidr = local.any_ipv4 }
+    public_in_https       = { nacl = "public", egress = false, rule = 110, from = local.enable_nat_gateway ? 443 : null, to = 443, cidr = local.any_ipv4 }
+    public_in_replies_lo  = { nacl = "public", egress = false, rule = 120, from = local.enable_nat_gateway ? 1024 : null, to = 3388, cidr = local.any_ipv4 }
+    public_in_replies_hi  = { nacl = "public", egress = false, rule = 121, from = local.enable_nat_gateway ? 3390 : null, to = 65535, cidr = local.any_ipv4 }
+    public_in_replies_vpc = { nacl = "public", egress = false, rule = 122, from = 1024, to = 65535, cidr = local.vpc_cidr }
+    public_out_http       = { nacl = "public", egress = true, rule = 100, from = local.enable_nat_gateway ? 80 : null, to = 80, cidr = local.any_ipv4 }
+    public_out_https      = { nacl = "public", egress = true, rule = 110, from = local.enable_nat_gateway ? 443 : null, to = 443, cidr = local.any_ipv4 }
+    public_out_replies    = { nacl = "public", egress = true, rule = 120, from = 1024, to = 65535, cidr = local.any_ipv4 }
+    public_out_app_a      = { nacl = "public", egress = true, rule = 130, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.a }
+    public_out_app_b      = { nacl = "public", egress = true, rule = 131, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.b }
 
     # App
     app_in_alb_a          = { nacl = "app", egress = false, rule = 100, from = local.app_port, to = local.app_port, cidr = local.public_subnet_cidrs.a }
@@ -464,7 +490,7 @@ locals {
     app_in_replies        = { nacl = "app", egress = false, rule = 120, from = 32768, to = 65535, cidr = local.any_ipv4 }
     app_in_endpoints_a    = { nacl = "app", egress = false, rule = 140, from = local.endpoints_port, to = local.endpoints_port, cidr = local.app_subnet_cidrs.a }
     app_in_endpoints_b    = { nacl = "app", egress = false, rule = 141, from = local.endpoints_port, to = local.endpoints_port, cidr = local.app_subnet_cidrs.b }
-    app_out_http          = { nacl = "app", egress = true, rule = 100, from = 80, to = 80, cidr = local.any_ipv4 }
+    app_out_http          = { nacl = "app", egress = true, rule = 100, from = local.enable_nat_gateway ? 80 : null, to = 80, cidr = local.any_ipv4 }
     app_out_https         = { nacl = "app", egress = true, rule = 110, from = 443, to = 443, cidr = local.any_ipv4 }
     app_out_replies_alb_a = { nacl = "app", egress = true, rule = 120, from = 1024, to = 65535, cidr = local.public_subnet_cidrs.a }
     app_out_replies_alb_b = { nacl = "app", egress = true, rule = 121, from = 1024, to = 65535, cidr = local.public_subnet_cidrs.b }
