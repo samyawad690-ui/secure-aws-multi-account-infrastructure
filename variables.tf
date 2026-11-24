@@ -30,7 +30,7 @@ variable "flow_logs_bucket_arn" {
 }
 
 variable "allowed_ingress_cidrs" {
-  description = "Approved test public IPs allowed to reach the ALB on port 80, as IPv4 CIDRs of /24 or smaller (for one IP: x.x.x.x/32)."
+  description = "Approved test public IPs allowed to reach the ALB on port 80, as IPv4 CIDRs from /24 to /32 (for one IP: x.x.x.x/32)."
   type        = list(string)
   default     = []
 
@@ -39,6 +39,6 @@ variable "allowed_ingress_cidrs" {
       for c in var.allowed_ingress_cidrs :
       can(cidrnetmask(c)) && try(tonumber(split("/", c)[1]) >= 24 && cidrsubnet(c, 0, 0) == c, false)
     ])
-    error_message = "allowed_ingress_cidrs takes approved test IPs only: IPv4 network CIDRs of /24 or smaller (for one IP use x.x.x.x/32)."
+    error_message = "allowed_ingress_cidrs takes approved test IPs only: IPv4 network CIDRs from /24 to /32 (for one IP use x.x.x.x/32)."
   }
 }

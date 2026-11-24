@@ -245,6 +245,11 @@ resource "aws_vpc_endpoint" "s3" {
   }
 }
 
+# Looked up by name so its CIDRs are known at plan time (used by the app NACL).
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.${data.aws_region.current.region}.s3"
+}
+
 resource "aws_vpc_endpoint" "ssm" {
   for_each = var.enable_interface_endpoints ? toset(local.ssm_endpoints) : toset([])
 
@@ -272,6 +277,8 @@ resource "aws_security_group" "alb" {
   }
 }
 
+# HTTP 80 only for the current demo; HTTPS comes later. It will need 443 here and in the
+# public NACL, separate from the NAT switch, from the same approved IPs.
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   for_each = toset(var.allowed_ingress_cidrs)
 
@@ -451,9 +458,19 @@ resource "aws_network_acl" "tier" {
   tags = {
     Name = "${local.name_prefix}-${each.key}-nacl"
   }
+
+  # AWS allows 20 rules per direction by default; the ICMP rule takes one.
+  lifecycle {
+    precondition {
+      condition = alltrue([for e in [true, false] :
+      length([for r in values(local.all_nacl_rules) : r if r.nacl == each.key && r.egress == e]) < 20])
+      error_message = "The ${each.key} NACL would have more than 20 rules in one direction. Check the number of S3 CIDRs."
+    }
+  }
 }
 
-# Stateless NACLs: replies use 1024-65535 (ALB, NAT) or 32768-65535 (servers).
+# Stateless NACLs: replies use 1024-65535 (ALB, NAT) or 32768-65535 (servers; the
+# Amazon Linux kernel uses 32768-60999).
 # Rules with a null port are skipped (their switch is off).
 locals {
   nacl_rules = {
@@ -469,7 +486,7 @@ locals {
     public_out_app_a      = { nacl = "public", egress = true, rule = 130, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.a }
     public_out_app_b      = { nacl = "public", egress = true, rule = 131, from = local.app_port, to = local.app_port, cidr = local.app_subnet_cidrs.b }
 
-    # App. NACLs can't use prefix lists, so with the NAT off S3 (gateway endpoint) is blocked too.
+    # App. S3 rules are in s3_nacl_rules below.
     app_in_alb_a          = { nacl = "app", egress = false, rule = 100, from = local.app_port, to = local.app_port, cidr = local.public_subnet_cidrs.a }
     app_in_alb_b          = { nacl = "app", egress = false, rule = 101, from = local.app_port, to = local.app_port, cidr = local.public_subnet_cidrs.b }
     app_in_replies        = { nacl = "app", egress = false, rule = 120, from = var.enable_nat_gateway ? 32768 : null, to = 65535, cidr = local.any_ipv4 }
@@ -496,10 +513,19 @@ locals {
     db_out_replies_a = { nacl = "db", egress = true, rule = 100, from = 1024, to = 65535, cidr = local.app_subnet_cidrs.a }
     db_out_replies_b = { nacl = "db", egress = true, rule = 101, from = 1024, to = 65535, cidr = local.app_subnet_cidrs.b }
   }
+
+  # S3 through the gateway endpoint, NAT on or off. NACLs can't use prefix lists, so one rule per S3 CIDR.
+  s3_cidrs = sort(data.aws_prefix_list.s3.cidr_blocks)
+  s3_nacl_rules = merge(
+    { for i, c in local.s3_cidrs : "app_out_s3_${i}" => { nacl = "app", egress = true, rule = 150 + i, from = 443, to = 443, cidr = c } },
+    { for i, c in local.s3_cidrs : "app_in_s3_replies_${i}" => { nacl = "app", egress = false, rule = 150 + i, from = 32768, to = 65535, cidr = c } },
+  )
+
+  all_nacl_rules = { for name, r in merge(local.nacl_rules, local.s3_nacl_rules) : name => r if r.from != null }
 }
 
 resource "aws_network_acl_rule" "tier" {
-  for_each = { for name, r in local.nacl_rules : name => r if r.from != null }
+  for_each = local.all_nacl_rules
 
   network_acl_id = aws_network_acl.tier[each.value.nacl].id
   egress         = each.value.egress
