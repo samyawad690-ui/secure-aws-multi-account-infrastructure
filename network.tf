@@ -464,7 +464,7 @@ resource "aws_network_acl" "tier" {
     precondition {
       condition = alltrue([for e in [true, false] :
       length([for r in values(local.all_nacl_rules) : r if r.nacl == each.key && r.egress == e]) < 20])
-      error_message = "The ${each.key} NACL would have more than 20 rules in one direction. Check the number of S3 CIDRs."
+      error_message = "The ${each.key} NACL would have more than 20 rules in one direction (AWS default quota). Check the number of S3 CIDRs and enable_interface_endpoints."
     }
   }
 }
@@ -475,9 +475,12 @@ resource "aws_network_acl" "tier" {
 locals {
   nacl_rules = {
     # Public. NAT-only rules exist only while the NAT is on.
-    # NAT replies need 1024-65535 (includes 3389): Security Hub EC2.21 fails while the NAT is on.
+    # No HTTPS from the internet yet (later stage). 110/111 are the app servers' HTTPS to the NAT.
+    # NAT replies need 1024-65535 (includes 3389), so Security Hub EC2.21 fails while the NAT is on.
+    # Trade-off to decide with Haitham; narrowing the range would break NAT connections.
     public_in_http        = { nacl = "public", egress = false, rule = 100, from = 80, to = 80, cidr = local.any_ipv4 }
-    public_in_https       = { nacl = "public", egress = false, rule = 110, from = var.enable_nat_gateway ? 443 : null, to = 443, cidr = local.any_ipv4 }
+    public_in_https_app_a = { nacl = "public", egress = false, rule = 110, from = var.enable_nat_gateway ? 443 : null, to = 443, cidr = local.app_subnet_cidrs.a }
+    public_in_https_app_b = { nacl = "public", egress = false, rule = 111, from = var.enable_nat_gateway ? 443 : null, to = 443, cidr = local.app_subnet_cidrs.b }
     public_in_replies     = { nacl = "public", egress = false, rule = 120, from = var.enable_nat_gateway ? 1024 : null, to = 65535, cidr = local.any_ipv4 }
     public_in_replies_vpc = { nacl = "public", egress = false, rule = 122, from = 1024, to = 65535, cidr = local.vpc_cidr }
     public_out_http       = { nacl = "public", egress = true, rule = 100, from = var.enable_nat_gateway ? 80 : null, to = 80, cidr = local.any_ipv4 }
@@ -514,11 +517,14 @@ locals {
     db_out_replies_b = { nacl = "db", egress = true, rule = 101, from = 1024, to = 65535, cidr = local.app_subnet_cidrs.b }
   }
 
-  # S3 through the gateway endpoint, NAT on or off. NACLs can't use prefix lists, so one rule per S3 CIDR.
+  # S3 through the gateway endpoint while the NAT is off (replies 1024-65535, any EC2 OS).
+  # NACLs can't use prefix lists, so one rule per S3 CIDR. With the NAT on these are skipped:
+  # app rules 110/120 (any IP) already match S3 (replies 32768-65535), and keeping both would
+  # exceed the 20-rule quota.
   s3_cidrs = sort(data.aws_prefix_list.s3.cidr_blocks)
   s3_nacl_rules = merge(
-    { for i, c in local.s3_cidrs : "app_out_s3_${i}" => { nacl = "app", egress = true, rule = 150 + i, from = 443, to = 443, cidr = c } },
-    { for i, c in local.s3_cidrs : "app_in_s3_replies_${i}" => { nacl = "app", egress = false, rule = 150 + i, from = 32768, to = 65535, cidr = c } },
+    { for i, c in local.s3_cidrs : "app_out_s3_${i}" => { nacl = "app", egress = true, rule = 150 + i, from = var.enable_nat_gateway ? null : 443, to = 443, cidr = c } },
+    { for i, c in local.s3_cidrs : "app_in_s3_replies_${i}" => { nacl = "app", egress = false, rule = 150 + i, from = var.enable_nat_gateway ? null : 1024, to = 65535, cidr = c } },
   )
 
   all_nacl_rules = { for name, r in merge(local.nacl_rules, local.s3_nacl_rules) : name => r if r.from != null }
