@@ -1,8 +1,15 @@
 # Compute layer (owner: Moaaz Ehab): internet-facing ALB, target group,
 # launch template, and a small Auto Scaling Group in the private app subnets.
 #
-# This file only consumes the network layer in network.tf. It does not create a
-# VPC, subnet, route table, NAT gateway, VPC endpoint, or Security Group.
+# This file only consumes the network layer in network.tf. It does not create or
+# modify a VPC, subnet, route table, NAT gateway, VPC endpoint, or Security Group.
+#
+# Network resources reused (all defined in network.tf):
+#   aws_vpc.main
+#   aws_subnet.public_a / aws_subnet.public_b
+#   aws_subnet.private_app_a / aws_subnet.private_app_b
+#   aws_security_group.alb / aws_security_group.app
+#   local.public_subnet_ids / local.app_subnet_ids / local.app_port / local.name_prefix
 
 # --- Compute inputs -----------------------------------------------------------
 # Kept in compute.tf (instead of the shared variables.tf) so this branch changes
@@ -33,7 +40,7 @@ variable "compute_max_size" {
 }
 
 variable "compute_instance_profile_name" {
-  description = "Optional existing IAM instance profile name from the Security layer (Haitham). Null means no instance profile is attached."
+  description = "Optional existing IAM instance profile name from the Security layer (Haitham). Null means no instance profile is attached. An instance profile alone does not enable SSM while NAT and interface endpoints are off."
   type        = string
   default     = null
 }
@@ -88,7 +95,10 @@ resource "aws_lb" "app" {
 
 # --- Target group -------------------------------------------------------------
 # HTTP on the application port agreed in network.tf (local.app_port = 8080).
-# Health checks use the app's index page, which returns 200.
+# Health check: GET / on port 8080 must return HTTP 200. The User Data below
+# starts a Python standard-library HTTP server on that port and serves
+# index.html. Runtime verification (target registered and healthy) requires a
+# deployment; terraform plan cannot prove it.
 
 resource "aws_lb_target_group" "app" {
   name        = "${local.name_prefix}-app-tg"
@@ -140,6 +150,12 @@ resource "aws_lb_listener" "http" {
 # No key pair and no public IP: administration is meant to go through SSM once
 # the Security layer supplies an instance profile. The app security group already
 # allows 8080 only from the ALB security group.
+#
+# SSM dependency: an instance profile alone is not enough. With
+# enable_nat_gateway = false and enable_interface_endpoints = false (the
+# defaults), the private app subnets have no path to the SSM service, so SSM and
+# Session Manager remain unavailable until the team approves and enables one of
+# those network options in network.tf. This file creates neither.
 
 resource "aws_launch_template" "app" {
   name        = "${local.name_prefix}-app-lt"
@@ -227,9 +243,11 @@ EOT
 }
 
 # --- Auto Scaling Group -------------------------------------------------------
-# One instance by default across both private app subnets, registered with the
-# target group by the ASG itself. Raise compute_desired_capacity to demonstrate
-# scaling; nothing else needs to change.
+# Cost defaults: one t3.micro instance across both private app subnets,
+# registered with the target group by the ASG itself. No NAT gateway, Elastic
+# IP, interface endpoint, ACM/HTTPS listener, CloudWatch alarm, or scaling policy
+# is created here. Raise compute_desired_capacity only for an approved scaling
+# demo; nothing else needs to change.
 
 resource "aws_autoscaling_group" "app" {
   name                = "${local.name_prefix}-app-asg"
